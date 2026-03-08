@@ -8,9 +8,21 @@
  * - 6x 10kΩ Resistors
  * 
  * POWER CONFIGURATION:
- * - FSR Sensors: 5V (from ESP32 5V pin) - Better sensitivity
+ * - FSR Sensors: 5V (from ESP32 5V pin)
  * - ADS1115 Modules: 3.3V (from ESP32 3.3V pin) - I2C logic
- * - NO LEVEL SHIFTER NEEDED - ADS1115 can read 0-5V analog
+ *
+ * !! HARDWARE WARNING !!
+ * ADS1115 powered at 3.3V has a max safe analog input of ~3.6V (VDD + 0.3V).
+ * With FSR at 5V and 10kΩ pull-down, the analog input can reach ~4.9V at max
+ * force, which EXCEEDS the safe input range and clamps readings at ~3.3V.
+ * This limits each sensor to ~0.7 kg max even though the FSR402 supports 10 kg.
+ *
+ * RECOMMENDED FIX (choose one):
+ *   Option A: Power ADS1115 from 5V → full 0-10 kg range per sensor
+ *   Option B: Power FSR from 3.3V (change V_SUPPLY below to 3.3) → full range,
+ *             slightly less sensitivity
+ *
+ * Current code uses V_SUPPLY = 5.0. Change to 3.3 if you use 3.3V for FSR.
  * 
  * Connections:
  * ADS1115 #1 (0x48):
@@ -62,9 +74,18 @@ const String DEVICE_ID = "ESP32-00FF00005C8C";
 // Measurement interval (milliseconds)
 const unsigned long SEND_INTERVAL = 2000;  // 2 seconds
 
-// Calibration factors (adjust based on your calibration)
-const float VOLTAGE_TO_FORCE_MULTIPLIER = 3.5;
-const float MIN_VOLTAGE_THRESHOLD = 0.1;  // Voltage below this = 0 kg
+// FSR circuit constants
+const float V_SUPPLY      = 5.0;    // FSR supply voltage (V) — change to 3.3 if using 3.3V
+const float R_PULLDOWN    = 10000.0; // Pull-down resistor value (Ω)
+const float MAX_FORCE_KG  = 10.0;   // FSR402 maximum rated force (kg)
+
+// FSR402 calibration constants (power-law model derived from FSR402 datasheet)
+// force_kg = FSR402_SCALE × (Vout / (V_SUPPLY - Vout)) ^ FSR402_EXPONENT
+// Calibrated data points: R≈30kΩ→0.1 kg, R≈4kΩ→1 kg, R≈400Ω→10 kg
+const float FSR402_SCALE    = 0.325;  // Adjust with known weights for your setup
+const float FSR402_EXPONENT = 1.063;  // Adjust with known weights for your setup
+
+const float MIN_VOLTAGE_THRESHOLD = 0.05; // Voltage below this = 0 kg (no contact)
 
 // ==================== HARDWARE SETUP ====================
 
@@ -196,28 +217,34 @@ void readAllSensors() {
 }
 
 float voltageToForce(float voltage) {
-  // Return 0 if voltage below threshold
+  // No contact — return 0
   if (voltage < MIN_VOLTAGE_THRESHOLD) {
     return 0.0;
   }
-  
-  // Simple linear conversion (adjust based on calibration)
-  float force = exp(voltage);
-  
-  // Advanced calibration curve (uncomment if you have calibration data)
-  /*
-  if (voltage < 0.5) {
-    force = voltage * 2.0;
-  } else if (voltage < 1.5) {
-    force = 1.0 + (voltage - 0.5) * 4.0;
-  } else if (voltage < 2.5) {
-    force = 5.0 + (voltage - 1.5) * 5.0;
-  } else {
-    force = 10.0 + (voltage - 2.5) * 6.0;
+
+  // Clamp to avoid divide-by-zero when voltage equals or exceeds V_SUPPLY
+  if (voltage >= V_SUPPLY) {
+    return MAX_FORCE_KG;
   }
-  */
-  
-  return force;
+
+  // Step 1: Recover FSR resistance from the voltage-divider circuit:
+  //   V_SUPPLY → FSR → (ADS input) → R_PULLDOWN → GND
+  //   Vout = V_SUPPLY × R_PULLDOWN / (R_FSR + R_PULLDOWN)
+  //   → R_FSR = R_PULLDOWN × (V_SUPPLY - Vout) / Vout
+  float R_FSR = R_PULLDOWN * (V_SUPPLY - voltage) / voltage;
+
+  // Step 2: FSR402 power-law calibration
+  //   The FSR402 resistance drops roughly as a power law with applied force.
+  //   Rearranging gives: force_kg = FSR402_SCALE × ratio ^ FSR402_EXPONENT
+  //   where ratio = Vout / (V_SUPPLY - Vout)  =  R_PULLDOWN / R_FSR
+  //
+  //   Derived from FSR402 datasheet typical values:
+  //     ~30 kΩ → 0.1 kg  |  ~4 kΩ → 1 kg  |  ~400 Ω → 10 kg
+  float ratio = R_PULLDOWN / R_FSR;  // equivalent to Vout / (V_SUPPLY - Vout)
+  float force_kg = FSR402_SCALE * pow(ratio, FSR402_EXPONENT);
+
+  // Step 3: Clamp output to valid sensor range [0, 10 kg]
+  return constrain(force_kg, 0.0, MAX_FORCE_KG);
 }
 
 // ==================== DISPLAY ====================
@@ -246,17 +273,17 @@ void printReadings() {
   
   Serial.println("╚════════════════════════════════════════════════╝");
   
-  // Optional: Show raw ADC and voltage values for debugging
-  /*
+  // Debug — raw ADC and voltage values (always shown to help verify wiring)
   Serial.println("\nDEBUG - Raw Values:");
   for (int i = 0; i < 6; i++) {
     Serial.printf("  FSR%d: ADC=%5d, Voltage=%.3fV, Force=%.2fkg\n",
-                  i+1, 
-                  currentReadings.adc[i], 
-                  currentReadings.voltage[i], 
+                  i+1,
+                  currentReadings.adc[i],
+                  currentReadings.voltage[i],
                   currentReadings.force[i]);
   }
-  */
+  Serial.printf("  [NOTE] ADS1115 at 3.3V clips input above ~3.3V. "
+                "Power ADS1115 from 5V for full 0-10 kg range.\n");
 }
 
 // ==================== NETWORK ====================
