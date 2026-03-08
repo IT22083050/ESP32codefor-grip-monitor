@@ -11,18 +11,28 @@
  * - FSR Sensors: 5V (from ESP32 5V pin)
  * - ADS1115 Modules: 3.3V (from ESP32 3.3V pin) - I2C logic
  *
- * !! HARDWARE WARNING !!
- * ADS1115 powered at 3.3V has a max safe analog input of ~3.6V (VDD + 0.3V).
- * With FSR at 5V and 10kΩ pull-down, the analog input can reach ~4.9V at max
- * force, which EXCEEDS the safe input range and clamps readings at ~3.3V.
- * This limits each sensor to ~0.7 kg max even though the FSR402 supports 10 kg.
+ * !! CRITICAL HARDWARE ISSUE — WHY YOU GET 10 kg ON LIGHT PRESS !!
  *
- * RECOMMENDED FIX (choose one):
- *   Option A: Power ADS1115 from 5V → full 0-10 kg range per sensor
- *   Option B: Power FSR from 3.3V (change V_SUPPLY below to 3.3) → full range,
- *             slightly less sensitivity
+ * ADS1115 at 3.3V VDD can only safely read analog input up to ~3.6V (VDD+0.3V).
+ * With FSR powered at 5V and 10kΩ pull-down, the voltage formula is:
+ *   Vout = 5V × 10kΩ / (R_FSR + 10kΩ)
  *
- * Current code uses V_SUPPLY = 5.0. Change to 3.3 if you use 3.3V for FSR.
+ * FSR402 typical resistance vs force (from datasheet):
+ *   0.1 kg → R ≈ 30 kΩ → Vout = 1.25V  ← OK for ADS1115 at 3.3V
+ *   1.0 kg → R ≈  5 kΩ → Vout = 3.33V  ← right at the ADS1115 3.3V limit!
+ *   5.0 kg → R ≈  2 kΩ → Vout = 4.17V  ← EXCEEDS 3.3V, ADS clips → reads 10 kg
+ *  10.0 kg → R ≈  1 kΩ → Vout = 4.55V  ← EXCEEDS 3.3V, ADS clips → reads 10 kg
+ *
+ * Result: any force above ~1 kg saturates the ADS1115 input and reads as 10 kg.
+ * This is WHY a smooth press immediately shows 10 kg.
+ *
+ * REQUIRED HARDWARE FIX:
+ *   Move ADS1115 VDD wire from ESP32 3.3V pin → ESP32 5V pin.
+ *   With VDD = 5V the ADS1115 safely reads up to 5.3V → full 0–10 kg range.
+ *
+ * Alternative (if 5V wire unavailable):
+ *   Power FSR from 3.3V instead of 5V, and set V_SUPPLY = 3.3 in the code.
+ *   Vout at 10 kg → 3.3 × 10/(1+10) = 3.0V  ← within ADS1115 3.3V range.
  * 
  * Connections:
  * ADS1115 #1 (0x48):
@@ -75,15 +85,19 @@ const String DEVICE_ID = "ESP32-00FF00005C8C";
 const unsigned long SEND_INTERVAL = 2000;  // 2 seconds
 
 // FSR circuit constants
-const float V_SUPPLY      = 5.0;    // FSR supply voltage (V) — change to 3.3 if using 3.3V
-const float R_PULLDOWN    = 10000.0; // Pull-down resistor value (Ω)
+// !! IMPORTANT: Measure your actual ESP32 5V pin with a multimeter and set V_SUPPLY.
+// USB power is often 5.05–5.15V. Wrong value here causes premature 10 kg clipping.
+const float V_SUPPLY      = 5.2;    // Set to measured 5V pin voltage (default 5.2 is safe upper bound)
+const float R_PULLDOWN    = 10000.0; // Pull-down resistor value (Ω) — see hardware warning above
 const float MAX_FORCE_KG  = 10.0;   // FSR402 maximum rated force (kg)
 
-// FSR402 calibration constants (power-law model derived from FSR402 datasheet)
-// force_kg = FSR402_SCALE × (Vout / (V_SUPPLY - Vout)) ^ FSR402_EXPONENT
-// Calibrated data points: R≈30kΩ→0.1 kg, R≈4kΩ→1 kg, R≈400Ω→10 kg
-const float FSR402_SCALE    = 0.325;  // Adjust with known weights for your setup
-const float FSR402_EXPONENT = 1.063;  // Adjust with known weights for your setup
+// FSR402 calibration constants — derived from Interlink FSR402 datasheet typical values:
+//   R ≈ 30 kΩ at 0.1 kg  |  R ≈ 5 kΩ at 1 kg  |  R ≈ 1 kΩ at 10 kg
+// formula: force_kg = FSR402_SCALE × (R_PULLDOWN / R_FSR) ^ FSR402_EXPONENT
+// For best accuracy: press sensor with a known weight and adjust FSR402_SCALE until
+// the displayed value matches the known weight.
+const float FSR402_SCALE    = 0.443;  // Adjust with known reference weights
+const float FSR402_EXPONENT = 1.354;  // Adjust with known reference weights
 
 const float MIN_VOLTAGE_THRESHOLD = 0.05; // Voltage below this = 0 kg (no contact)
 
@@ -282,8 +296,11 @@ void printReadings() {
                   currentReadings.voltage[i],
                   currentReadings.force[i]);
   }
-  Serial.printf("  [NOTE] ADS1115 at 3.3V clips input above ~3.3V. "
-                "Power ADS1115 from 5V for full 0-10 kg range.\n");
+  Serial.println("  ---");
+  Serial.println("  [FIX REQUIRED] If readings jump to 10kg on light press:");
+  Serial.println("  Move ADS1115 VDD wire: 3.3V pin -> 5V pin on ESP32.");
+  Serial.printf("  V_SUPPLY=%.1fV | R_PULLDOWN=%.0fΩ | MAX=%.1fkg\n",
+                V_SUPPLY, R_PULLDOWN, MAX_FORCE_KG);
 }
 
 // ==================== NETWORK ====================
